@@ -122,6 +122,27 @@ namespace ICSharpCode.TreeView
 		TreeFlattener flattener;
 		bool updatesLocked;
 
+		public IDisposable LockUpdates()
+		{
+			return new UpdateLock(this);
+		}
+
+		class UpdateLock : IDisposable
+		{
+			SharpTreeView instance;
+
+			public UpdateLock(SharpTreeView instance)
+			{
+				this.instance = instance;
+				this.instance.updatesLocked = true;
+			}
+
+			public void Dispose()
+			{
+				this.instance.updatesLocked = false;
+			}
+		}
+
 		void Reload()
 		{
 			if (flattener != null) {
@@ -322,8 +343,12 @@ namespace ICSharpCode.TreeView
 			return null;
 		}
 
+		protected override System.Windows.Automation.Peers.AutomationPeer OnCreateAutomationPeer()
+		{
+			return new SharpTreeViewAutomationPeer(this);
+		}
 		#region Track selection
-		
+
 		protected override void OnSelectionChanged(SelectionChangedEventArgs e)
 		{
 			foreach (SharpTreeNode node in e.RemovedItems) {

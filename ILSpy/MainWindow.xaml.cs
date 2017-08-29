@@ -257,7 +257,15 @@ namespace ICSharpCode.ILSpy
 		
 		void HandleCommandLineArgumentsAfterShowList(CommandLineArguments args)
 		{
-			if (args.NavigateTo != null) {
+			// if a SaveDirectory is given, do not start a second concurrent decompilation
+			// by executing JumpoToReference (leads to https://github.com/icsharpcode/ILSpy/issues/710)
+			if (!string.IsNullOrEmpty(args.SaveDirectory)) {
+				foreach (var x in commandLineLoadedAssemblies) {
+					x.ContinueWhenLoaded((Task<ModuleDefinition> moduleTask) => {
+						OnExportAssembly(moduleTask, args.SaveDirectory);
+					}, TaskScheduler.FromCurrentSynchronizationContext());
+				}
+			} else if (args.NavigateTo != null) {
 				bool found = false;
 				if (args.NavigateTo.StartsWith("N:", StringComparison.Ordinal)) {
 					string namespaceName = args.NavigateTo.Substring(2);
@@ -299,13 +307,6 @@ namespace ICSharpCode.ILSpy
 			{
 				SearchPane.Instance.SearchTerm = args.Search;
 				SearchPane.Instance.Show();
-			}
-			if (!string.IsNullOrEmpty(args.SaveDirectory)) {
-				foreach (var x in commandLineLoadedAssemblies) {
-					x.ContinueWhenLoaded( (Task<ModuleDefinition> moduleTask) => {
-						OnExportAssembly(moduleTask, args.SaveDirectory);
-					}, TaskScheduler.FromCurrentSynchronizationContext());
-				}
 			}
 			commandLineLoadedAssemblies.Clear(); // clear references once we don't need them anymore
 		}
@@ -398,27 +399,44 @@ namespace ICSharpCode.ILSpy
 		#region Update Check
 		string updateAvailableDownloadUrl;
 		
-		void ShowMessageIfUpdatesAvailableAsync(ILSpySettings spySettings)
+		public void ShowMessageIfUpdatesAvailableAsync(ILSpySettings spySettings, bool forceCheck = false)
 		{
-			AboutPage.CheckForUpdatesIfEnabledAsync(spySettings).ContinueWith(
-				delegate (Task<string> task) {
-					if (task.Result != null) {
-						updateAvailableDownloadUrl = task.Result;
-						updateAvailablePanel.Visibility = Visibility.Visible;
-					}
-				},
-				TaskScheduler.FromCurrentSynchronizationContext()
-			);
+			Task<string> result;
+			if (forceCheck) {
+				result = AboutPage.CheckForUpdatesAsync(spySettings);
+			} else {
+				result = AboutPage.CheckForUpdatesIfEnabledAsync(spySettings);
+			}
+			result.ContinueWith(task => AdjustUpdateUIAfterCheck(task, forceCheck), TaskScheduler.FromCurrentSynchronizationContext());
 		}
 		
-		void updateAvailablePanelCloseButtonClick(object sender, RoutedEventArgs e)
+		void updatePanelCloseButtonClick(object sender, RoutedEventArgs e)
 		{
-			updateAvailablePanel.Visibility = Visibility.Collapsed;
+			updatePanel.Visibility = Visibility.Collapsed;
 		}
 		
-		void downloadUpdateButtonClick(object sender, RoutedEventArgs e)
+		void downloadOrCheckUpdateButtonClick(object sender, RoutedEventArgs e)
 		{
-			Process.Start(updateAvailableDownloadUrl);
+			if (updateAvailableDownloadUrl != null) {
+				Process.Start(updateAvailableDownloadUrl);
+			} else {
+				updatePanel.Visibility = Visibility.Collapsed;
+				AboutPage.CheckForUpdatesAsync(spySettings ?? ILSpySettings.Load())
+					.ContinueWith(task => AdjustUpdateUIAfterCheck(task, true), TaskScheduler.FromCurrentSynchronizationContext());
+			}
+		}
+
+		void AdjustUpdateUIAfterCheck(Task<string> task, bool displayMessage)
+		{
+			updateAvailableDownloadUrl = task.Result;
+			updatePanel.Visibility = displayMessage ? Visibility.Visible : Visibility.Collapsed;
+			if (task.Result != null) {
+				updatePanelMessage.Text = "A new ILSpy version is available.";
+				downloadOrCheckUpdateButton.Content = "Download";
+			} else {
+				updatePanelMessage.Text = "No update for ILSpy found.";
+				downloadOrCheckUpdateButton.Content = "Check again";
+			}
 		}
 		#endregion
 		
@@ -531,6 +549,14 @@ namespace ICSharpCode.ILSpy
 				}
 			}
 		}
+
+		public void SelectNodes(IEnumerable<SharpTreeNode> nodes)
+		{
+			if (nodes.Any() && nodes.All(n => !n.AncestorsAndSelf().Any(a => a.IsHidden))) {
+				treeView.FocusNode(nodes.First());
+				treeView.SetSelectedNodes(nodes);
+			}
+		}
 		
 		/// <summary>
 		/// Retrieves a node using the .ToString() representations of its ancestors.
@@ -557,7 +583,7 @@ namespace ICSharpCode.ILSpy
 		/// <summary>
 		/// Gets the .ToString() representation of the node's ancestors.
 		/// </summary>
-		public string[] GetPathForNode(SharpTreeNode node)
+		public static string[] GetPathForNode(SharpTreeNode node)
 		{
 			if (node == null)
 				return null;
@@ -823,7 +849,7 @@ namespace ICSharpCode.ILSpy
 			sessionSettings.WindowBounds = this.RestoreBounds;
 			sessionSettings.SplitterPosition = leftColumn.Width.Value / (leftColumn.Width.Value + rightColumn.Width.Value);
 			if (topPane.Visibility == Visibility.Visible)
-				sessionSettings.BottomPaneSplitterPosition = topPaneRow.Height.Value / (topPaneRow.Height.Value + textViewRow.Height.Value);
+				sessionSettings.TopPaneSplitterPosition = topPaneRow.Height.Value / (topPaneRow.Height.Value + textViewRow.Height.Value);
 			if (bottomPane.Visibility == Visibility.Visible)
 				sessionSettings.BottomPaneSplitterPosition = bottomPaneRow.Height.Value / (bottomPaneRow.Height.Value + textViewRow.Height.Value);
 			sessionSettings.Save();
@@ -846,10 +872,40 @@ namespace ICSharpCode.ILSpy
 		}
 		
 		#region Top/Bottom Pane management
+
+		/// <summary>
+		///   When grid is resized using splitter, row height value could become greater than 1.
+		///   As result, when a new pane is shown, both textView and pane could become very small.
+		///   This method normalizes two rows and ensures that height is less then 1.
+		/// </summary>
+		void NormalizePaneRowHeightValues(RowDefinition pane1Row, RowDefinition pane2Row)
+		{
+			var pane1Height = pane1Row.Height;
+			var pane2Height = pane2Row.Height;
+
+			//only star height values are normalized.
+			if (!pane1Height.IsStar || !pane2Height.IsStar)
+			{
+				return;
+			}
+
+			var totalHeight = pane1Height.Value + pane2Height.Value;
+			if (totalHeight == 0)
+			{
+				return;
+			}
+
+			pane1Row.Height = new GridLength(pane1Height.Value / totalHeight, GridUnitType.Star);
+			pane2Row.Height = new GridLength(pane2Height.Value / totalHeight, GridUnitType.Star);
+		}
+
 		public void ShowInTopPane(string title, object content)
 		{
 			topPaneRow.MinHeight = 100;
 			if (sessionSettings.TopPaneSplitterPosition > 0 && sessionSettings.TopPaneSplitterPosition < 1) {
+				//Ensure all 3 blocks are in fair conditions
+				NormalizePaneRowHeightValues(bottomPaneRow, textViewRow);
+
 				textViewRow.Height = new GridLength(1 - sessionSettings.TopPaneSplitterPosition, GridUnitType.Star);
 				topPaneRow.Height = new GridLength(sessionSettings.TopPaneSplitterPosition, GridUnitType.Star);
 			}
@@ -880,6 +936,9 @@ namespace ICSharpCode.ILSpy
 		{
 			bottomPaneRow.MinHeight = 100;
 			if (sessionSettings.BottomPaneSplitterPosition > 0 && sessionSettings.BottomPaneSplitterPosition < 1) {
+				//Ensure all 3 blocks are in fair conditions
+				NormalizePaneRowHeightValues(topPaneRow, textViewRow);
+
 				textViewRow.Height = new GridLength(1 - sessionSettings.BottomPaneSplitterPosition, GridUnitType.Star);
 				bottomPaneRow.Height = new GridLength(sessionSettings.BottomPaneSplitterPosition, GridUnitType.Star);
 			}
